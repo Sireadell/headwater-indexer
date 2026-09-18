@@ -1,0 +1,63 @@
+type Agent {
+  # ERC-8004 agentId
+  id: ID!
+  owner: String!
+  agentURI: String!
+  registeredAtBlock: Int!
+  registeredAtTimestamp: Int!
+  feedbacks: [Feedback!]! @derivedFrom(field: "agent")
+}
+
+type Reviewer {
+  # wallet address that has given feedback and/or moved AUSD
+  id: ID!
+  feedbacksGiven: [Feedback!]! @derivedFrom(field: "reviewer")
+  fundingReceived: [FundingTransfer!]! @derivedFrom(field: "to")
+  fundingSent: [FundingTransfer!]! @derivedFrom(field: "from")
+  # Maintained incrementally in the NewFeedback handler, not recomputed by
+  # a script scan. Grows as real feedback events arrive across full chain
+  # history, unbounded by any lookback window.
+  distinctAgentIds: [String!]!
+  distinctAgentCount: Int!
+}
+
+type Feedback {
+  # agentId-reviewerAddress-feedbackIndex
+  id: ID!
+  agent: Agent!
+  reviewer: Reviewer!
+  feedbackIndex: BigInt!
+  value: BigInt!
+  valueDecimals: Int!
+  tag1: String!
+  tag2: String!
+  revoked: Boolean!
+  blockNumber: Int!
+  timestamp: Int!
+  txHash: String!
+}
+
+type FundingTransfer {
+  # txHash-logIndex
+  id: ID!
+  from: Reviewer!
+  to: Reviewer!
+  value: BigInt!
+  blockNumber: Int!
+  timestamp: Int!
+  txHash: String!
+}
+
+# The derived/aggregated entity this indexer exists for: a reviewer wallet
+# that has reviewed more than one agent. Computed live, incrementally, at
+# index time from real NewFeedback events across ALL of Monad's history,
+# not scanned on demand across a bounded set of agents the way
+# headwater/src/crossAgentReviewOverlap.js currently has to. Only created
+# once a reviewer's SECOND distinct agent shows up, so its mere existence
+# is itself the finding.
+type CrossAgentOverlap {
+  id: ID! # reviewer address
+  reviewer: Reviewer!
+  agentIds: [String!]!
+  agentCount: Int!
+}

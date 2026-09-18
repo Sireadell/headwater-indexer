@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=./node_modules/envio/evm.schema.json
+name: headwater-indexer
+description: Funding-provenance and cross-agent review overlap indexer for ERC-8004 agent reputation on Monad. Built for Headwater (headwater/), replaces its bounded ~22-minute eth_getLogs lookback with full chain history via Envio HyperSync.
+disable_default_cross_chain: true
+contracts:
+  - name: IdentityRegistry
+    events:
+      - event: "Registered(uint256 indexed agentId, string agentURI, address indexed owner)"
+  - name: ReputationRegistry
+    events:
+      - event: "NewFeedback(uint256 indexed agentId, address indexed clientAddress, uint64 feedbackIndex, int128 value, uint8 valueDecimals, string indexed indexedTag1, string tag1, string tag2, string endpoint, string feedbackURI, bytes32 feedbackHash)"
+      - event: "FeedbackRevoked(uint256 indexed agentId, address indexed clientAddress, uint64 indexed feedbackIndex)"
+  - name: AUSD
+    events:
+      - event: "Transfer(address indexed from, address indexed to, uint256 value)"
+chains:
+  - id: 143 # Monad Mainnet
+    start_block: 0
+    contracts:
+      - name: IdentityRegistry
+        address: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"
+      - name: ReputationRegistry
+        address: "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"
+      - name: AUSD
+        address: "0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a"
+        # Bounded, not genesis. AUSD settles activity across all of Monad,
+        # not just agent wallets -- indexing it from block 0 OOM'd a local
+        # test run (confirmed live). This still reaches ~100x deeper than
+        # headwater/'s current 4.2-hour (50,000 block) raw eth_getLogs cap,
+        # ~101M blocks of real funding history instead of ~50k.
+        start_block: 101000000
