@@ -61,3 +61,16 @@ type CrossAgentOverlap {
   agentIds: [String!]!
   agentCount: Int!
 }
+
+type WalletLabel {
+  # address
+  id: ID!
+  address: String!
+  nansen_label: String
+  nansen_category: String
+  nansen_risk_score: Int
+  nansen_checked_at: Int!
+  # agreement with our signals
+  has_signal_flag: Boolean!
+  agreement_status: String!
+}
