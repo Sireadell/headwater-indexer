@@ -74,3 +74,46 @@ type WalletLabel {
   has_signal_flag: Boolean!
   agreement_status: String!
 }
+
+# Marker edge, one row per (from,to) pair that has EVER transferred AUSD.
+# Lets circular-funding detection be an O(1) lookup instead of a rescan:
+# when X sends to Y, check whether an edge Y-to-X already exists.
+type DirectedFundingEdge {
+  id: ID! # "from-to", lowercased addresses
+  from: String!
+  to: String!
+  firstTxHash: String!
+  transferCount: Int!
+}
+
+# Ported from headwater/src/core/signals/circularFunding.js: wallet A funds
+# wallet B, and B has independently sent AUSD back to A. Strongest
+# deterministic signal in Headwater's original detection set, now computed
+# live at index time across full chain history instead of a bounded
+# per-request RPC scan.
+type CircularFunding {
+  id: ID! # sorted "walletA-walletB" so the pair is symmetric
+  walletA: String!
+  walletB: String!
+  firstDirectionTxHash: String!
+  returnTxHash: String!
+  detectedAtBlock: Int!
+  detectedAtTimestamp: Int!
+}
+
+# Ported from headwater/src/core/signals/fanOut.js: a funder that pays out
+# to >=15 distinct recipients over >=25 hours looks like an
+# exchange/payment-processor, not a coordinated funder. Same thresholds as
+# the original signal (FAN_OUT_THRESHOLD=15, MIN_FAN_OUT_SPAN_SECONDS=25h).
+# Circumstantial only -- never sufficient alone to call something risky,
+# same constraint the original signal enforces.
+type FunderFanOut {
+  id: ID! # funder address
+  funder: String!
+  recipients: [String!]!
+  recipientCount: Int!
+  firstPaymentTimestamp: Int!
+  lastPaymentTimestamp: Int!
+  spanSeconds: Int!
+  thresholdMet: Boolean!
+}

@@ -2,6 +2,9 @@
 name: headwater-indexer
 description: Funding-provenance and cross-agent review overlap indexer for ERC-8004 agent reputation on Monad. Built for Headwater (headwater/), replaces its bounded ~22-minute eth_getLogs lookback with full chain history via Envio HyperSync.
 disable_default_cross_chain: true
+field_selection:
+  transaction_fields:
+    - hash
 contracts:
   - name: IdentityRegistry
     events:
