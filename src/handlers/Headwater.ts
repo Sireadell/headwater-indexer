@@ -10,6 +10,7 @@ import {
   type CircularFunding,
   type FunderFanOut,
 } from "envio";
+import { getWalletAusdHistory, type WalletTransferRecord } from "../effects/walletHistory";
 
 const NANSEN_API_KEY = process.env.NANSEN_API_KEY;
 const NANSEN_BASE_URL = "https://api.nansen.ai/v2";
@@ -91,6 +92,123 @@ function norm(address: string): string {
   return address.toLowerCase();
 }
 
+// Shared by the live AUSD Transfer handler AND the per-wallet historical
+// backfill (see effects/walletHistory.ts) so a backfilled transfer from
+// months ago gets exactly the same circular-funding / fan-out / Nansen
+// treatment as one observed live.
+async function processFundingTransfer(
+  context: any,
+  fromAddrRaw: string,
+  toAddrRaw: string,
+  value: bigint,
+  blockNumber: number,
+  timestamp: number,
+  txHash: string,
+  logIndex: number,
+): Promise<void> {
+  const fromAddr = norm(fromAddrRaw);
+  const toAddr = norm(toAddrRaw);
+
+  // Edge case fix: zero-value transfers are not real funding. The
+  // ported circularFunding.js signal requires a strictly positive value
+  // for exactly this reason (a zero-value contract call is not proof of
+  // a real transfer). Without this check, a no-op transfer could
+  // trigger a false circular-funding or fan-out flag.
+  if (value <= 0n) return;
+
+  await ensureReviewer(context, fromAddr);
+  await ensureReviewer(context, toAddr);
+
+  const transferId = `${txHash}-${logIndex}`;
+  const existingTransfer = await context.FundingTransfer.get(transferId);
+  if (existingTransfer !== undefined) return; // already processed (live path already saw it)
+
+  const transfer: FundingTransfer = {
+    id: transferId,
+    from_id: fromAddr,
+    to_id: toAddr,
+    value,
+    blockNumber,
+    timestamp,
+    txHash,
+  };
+  context.FundingTransfer.set(transfer);
+
+  // --- Circular funding (ported from circularFunding.js) ---
+  const forwardEdgeId = `${fromAddr}-${toAddr}`;
+  const reverseEdgeId = `${toAddr}-${fromAddr}`;
+
+  const existingForward = await context.DirectedFundingEdge.get(forwardEdgeId);
+  const forwardEdge: DirectedFundingEdge = existingForward
+    ? { ...existingForward, transferCount: existingForward.transferCount + 1 }
+    : { id: forwardEdgeId, from: fromAddr, to: toAddr, firstTxHash: txHash, transferCount: 1 };
+  context.DirectedFundingEdge.set(forwardEdge);
+
+  const reverseEdge = await context.DirectedFundingEdge.get(reverseEdgeId);
+  if (reverseEdge !== undefined) {
+    // Edge case fix: a normal exchange deposit/withdrawal cycle between
+    // the same two wallets looks identical to real circular funding on
+    // this signal alone. Skip the flag if either side is a
+    // Nansen-confirmed legitimate actor, same filter already applied to
+    // FunderFanOut and WalletLabel.
+    const fromNansen = await getNansenLabelCached(context, fromAddr);
+    const toNansen = await getNansenLabelCached(context, toAddr);
+    if (!isLegitimateActor(fromNansen) && !isLegitimateActor(toNansen)) {
+      const pairId = [fromAddr, toAddr].sort().join("-");
+      const circular: CircularFunding = {
+        id: pairId,
+        walletA: fromAddr,
+        walletB: toAddr,
+        firstDirectionTxHash: reverseEdge.firstTxHash,
+        returnTxHash: txHash,
+        detectedAtBlock: blockNumber,
+        detectedAtTimestamp: timestamp,
+      };
+      context.CircularFunding.set(circular);
+    }
+  }
+
+  // --- Funder fan-out (ported from fanOut.js, same thresholds) ---
+  const existingFanOut = await context.FunderFanOut.get(fromAddr);
+  const priorCount = existingFanOut ? existingFanOut.recipientCount : 0;
+  const alreadyStored = existingFanOut ? existingFanOut.recipients.includes(toAddr) : false;
+
+  const recipients = existingFanOut ? [...existingFanOut.recipients] : [];
+  if (!alreadyStored && recipients.length < MAX_STORED_RECIPIENTS) {
+    recipients.push(toAddr);
+  }
+  // recipientCount stays authoritative even once the stored array caps out.
+  const recipientCount = alreadyStored ? priorCount : priorCount + 1;
+
+  const firstPaymentTimestamp = existingFanOut
+    ? Math.min(existingFanOut.firstPaymentTimestamp, timestamp)
+    : timestamp;
+  const lastPaymentTimestamp = existingFanOut
+    ? Math.max(existingFanOut.lastPaymentTimestamp, timestamp)
+    : timestamp;
+  const spanSeconds = lastPaymentTimestamp - firstPaymentTimestamp;
+  const thresholdMet = recipientCount >= FAN_OUT_THRESHOLD && spanSeconds >= MIN_FAN_OUT_SPAN_SECONDS;
+
+  context.FunderFanOut.set({
+    id: fromAddr,
+    funder: fromAddr,
+    recipients,
+    recipientCount,
+    firstPaymentTimestamp,
+    lastPaymentTimestamp,
+    spanSeconds,
+    thresholdMet,
+  });
+
+  // Nansen: only store a label for wallets not already known-legitimate,
+  // so exchanges/market-makers don't pollute the suspicious-wallet table.
+  // Cached lookup avoids re-calling Nansen for a wallet already checked.
+  const nansen = await getNansenLabelCached(context, fromAddr);
+  if (nansen && !isLegitimateActor(nansen)) {
+    context.WalletLabel.set(nansen);
+  }
+}
+
 async function ensureReviewer(context: any, address: string): Promise<Reviewer> {
   const id = norm(address);
   let reviewer = await context.Reviewer.get(id);
@@ -99,6 +217,32 @@ async function ensureReviewer(context: any, address: string): Promise<Reviewer> 
     context.Reviewer.set(reviewer);
   }
   return reviewer;
+}
+
+// Only called for a wallet's FIRST-ever appearance as a Reviewer (see the
+// NewFeedback handler below) -- a rare event, hundreds of times total,
+// not per-transfer, so the deep HyperSync query this triggers stays cheap
+// in aggregate even though each individual query goes back to genesis.
+async function backfillReviewerFundingHistory(context: any, reviewerAddress: string): Promise<void> {
+  let history: WalletTransferRecord[];
+  try {
+    history = await context.effect(getWalletAusdHistory, reviewerAddress);
+  } catch (err) {
+    console.log(`Funding-history backfill skipped for ${reviewerAddress}`);
+    return;
+  }
+  for (const record of history) {
+    await processFundingTransfer(
+      context,
+      record.from,
+      record.to,
+      BigInt(record.value),
+      record.blockNumber,
+      record.timestamp,
+      record.txHash,
+      record.logIndex,
+    );
+  }
 }
 
 indexer.onEvent(
@@ -126,7 +270,19 @@ indexer.onEvent(
   async ({ event, context }) => {
     const agentId = event.params.agentId.toString();
     const reviewerAddress = norm(event.params.clientAddress);
-    const reviewer = await ensureReviewer(context, reviewerAddress);
+    const isNewReviewer = (await context.Reviewer.get(reviewerAddress)) === undefined;
+    await ensureReviewer(context, reviewerAddress);
+
+    // The actual fraud shape this tool exists to catch -- fund a wallet
+    // quietly, wait, then use it to review later -- specifically defeats
+    // a short rolling funding window, because the funding happens BEFORE
+    // the wallet is "known" to watch. Fix: the moment a wallet is first
+    // discovered as a reviewer, pull its full AUSD history directly via
+    // HyperSync (cached forever, so this never repeats for the same
+    // wallet), instead of only relying on the live indexed window.
+    if (isNewReviewer) {
+      await backfillReviewerFundingHistory(context, reviewerAddress);
+    }
 
     const feedback: Feedback = {
       id: `${agentId}-${reviewerAddress}-${event.params.feedbackIndex.toString()}`,
@@ -144,10 +300,13 @@ indexer.onEvent(
     };
     context.Feedback.set(feedback);
 
-    if (!reviewer.distinctAgentIds.includes(agentId)) {
-      const updatedIds = [...reviewer.distinctAgentIds, agentId];
+    // Re-read: the backfill above may have created FundingTransfer rows
+    // touching this reviewer, but distinctAgentIds only changes here.
+    const currentReviewer = await context.Reviewer.getOrThrow(reviewerAddress);
+    if (!currentReviewer.distinctAgentIds.includes(agentId)) {
+      const updatedIds = [...currentReviewer.distinctAgentIds, agentId];
       context.Reviewer.set({
-        ...reviewer,
+        ...currentReviewer,
         distinctAgentIds: updatedIds,
         distinctAgentCount: updatedIds.length,
       });
@@ -183,102 +342,15 @@ indexer.onEvent(
 indexer.onEvent(
   { contract: "AUSD", event: "Transfer" },
   async ({ event, context }) => {
-    const fromAddr = norm(event.params.from);
-    const toAddr = norm(event.params.to);
-
-    // Edge case fix: zero-value transfers are not real funding. The
-    // ported circularFunding.js signal requires a strictly positive value
-    // for exactly this reason (a zero-value contract call is not proof of
-    // a real transfer). Without this check, a no-op transfer could
-    // trigger a false circular-funding or fan-out flag.
-    if (event.params.value <= 0n) return;
-
-    await ensureReviewer(context, fromAddr);
-    await ensureReviewer(context, toAddr);
-
-    const transfer: FundingTransfer = {
-      id: `${event.transaction.hash}-${event.logIndex}`,
-      from_id: fromAddr,
-      to_id: toAddr,
-      value: event.params.value,
-      blockNumber: event.block.number,
-      timestamp: event.block.timestamp,
-      txHash: event.transaction.hash,
-    };
-    context.FundingTransfer.set(transfer);
-
-    // --- Circular funding (ported from circularFunding.js) ---
-    const forwardEdgeId = `${fromAddr}-${toAddr}`;
-    const reverseEdgeId = `${toAddr}-${fromAddr}`;
-
-    const existingForward = await context.DirectedFundingEdge.get(forwardEdgeId);
-    const forwardEdge: DirectedFundingEdge = existingForward
-      ? { ...existingForward, transferCount: existingForward.transferCount + 1 }
-      : { id: forwardEdgeId, from: fromAddr, to: toAddr, firstTxHash: event.transaction.hash, transferCount: 1 };
-    context.DirectedFundingEdge.set(forwardEdge);
-
-    const reverseEdge = await context.DirectedFundingEdge.get(reverseEdgeId);
-    if (reverseEdge !== undefined) {
-      // Edge case fix: a normal exchange deposit/withdrawal cycle between
-      // the same two wallets looks identical to real circular funding on
-      // this signal alone. Skip the flag if either side is a
-      // Nansen-confirmed legitimate actor, same filter already applied to
-      // FunderFanOut and WalletLabel.
-      const fromNansen = await getNansenLabelCached(context, fromAddr);
-      const toNansen = await getNansenLabelCached(context, toAddr);
-      if (!isLegitimateActor(fromNansen) && !isLegitimateActor(toNansen)) {
-        const pairId = [fromAddr, toAddr].sort().join("-");
-        const circular: CircularFunding = {
-          id: pairId,
-          walletA: fromAddr,
-          walletB: toAddr,
-          firstDirectionTxHash: reverseEdge.firstTxHash,
-          returnTxHash: event.transaction.hash,
-          detectedAtBlock: event.block.number,
-          detectedAtTimestamp: event.block.timestamp,
-        };
-        context.CircularFunding.set(circular);
-      }
-    }
-
-    // --- Funder fan-out (ported from fanOut.js, same thresholds) ---
-    const existingFanOut = await context.FunderFanOut.get(fromAddr);
-    const priorCount = existingFanOut ? existingFanOut.recipientCount : 0;
-    const alreadyStored = existingFanOut ? existingFanOut.recipients.includes(toAddr) : false;
-
-    const recipients = existingFanOut ? [...existingFanOut.recipients] : [];
-    if (!alreadyStored && recipients.length < MAX_STORED_RECIPIENTS) {
-      recipients.push(toAddr);
-    }
-    // recipientCount stays authoritative even once the stored array caps out.
-    const recipientCount = alreadyStored ? priorCount : priorCount + 1;
-
-    const firstPaymentTimestamp = existingFanOut
-      ? Math.min(existingFanOut.firstPaymentTimestamp, event.block.timestamp)
-      : event.block.timestamp;
-    const lastPaymentTimestamp = existingFanOut
-      ? Math.max(existingFanOut.lastPaymentTimestamp, event.block.timestamp)
-      : event.block.timestamp;
-    const spanSeconds = lastPaymentTimestamp - firstPaymentTimestamp;
-    const thresholdMet = recipientCount >= FAN_OUT_THRESHOLD && spanSeconds >= MIN_FAN_OUT_SPAN_SECONDS;
-
-    context.FunderFanOut.set({
-      id: fromAddr,
-      funder: fromAddr,
-      recipients,
-      recipientCount,
-      firstPaymentTimestamp,
-      lastPaymentTimestamp,
-      spanSeconds,
-      thresholdMet,
-    });
-
-    // Nansen: only store a label for wallets not already known-legitimate,
-    // so exchanges/market-makers don't pollute the suspicious-wallet table.
-    // Cached lookup avoids re-calling Nansen for a wallet already checked.
-    const nansen = await getNansenLabelCached(context, fromAddr);
-    if (nansen && !isLegitimateActor(nansen)) {
-      context.WalletLabel.set(nansen);
-    }
+    await processFundingTransfer(
+      context,
+      event.params.from,
+      event.params.to,
+      event.params.value,
+      event.block.number,
+      event.block.timestamp,
+      event.transaction.hash,
+      event.logIndex,
+    );
   },
 );

@@ -14,6 +14,7 @@
     "vitest": "4.1.0"
   },
   "dependencies": {
+    "@envio-dev/hypersync-client": "^1.4.1",
     "envio": "3.12.1"
   },
   "engines": {
