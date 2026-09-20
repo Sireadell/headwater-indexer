@@ -7,7 +7,7 @@ const CHAIN_ID = 143;
 // AUSD is configured with start_block: 101000000 in config.yaml -- any
 // simulated AUSD event needs a block number at or past that, or the test
 // harness filters it out the same way the real indexer would.
-const AUSD_TEST_BLOCK = 101_000_001;
+const AUSD_TEST_BLOCK = 106_160_001;
 
 describe("Agent registration", () => {
   it("creates an Agent entity from a Registered event", async (t) => {

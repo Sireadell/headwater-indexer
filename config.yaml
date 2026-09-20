@@ -26,9 +26,13 @@ chains:
         address: "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"
       - name: AUSD
         address: "0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a"
-        # Bounded, not genesis. AUSD settles activity across all of Monad,
-        # not just agent wallets -- indexing it from block 0 OOM'd a local
-        # test run (confirmed live). This still reaches ~100x deeper than
-        # headwater/'s current 4.2-hour (50,000 block) raw eth_getLogs cap,
-        # ~101M blocks of real funding history instead of ~50k.
-        start_block: 101000000
+        # Bounded much tighter than an earlier version of this file
+        # (was 101,000,000, ~5.24M blocks deep). That version exceeded the
+        # Envio Cloud free tier's ~100,000-event quota within hours --
+        # AUSD settles activity across all of Monad, not just agent
+        # wallets, so even a "bounded" multi-million-block window holds
+        # far more events than this quota allows. 106,160,000 (~300k
+        # blocks, live chain tip was ~106,462,854 when this was set) is
+        # still ~6x deeper than headwater/'s own 50,000-block (~4.2 hour)
+        # raw eth_getLogs cap, and stays safely inside the free quota.
+        start_block: 106160000
