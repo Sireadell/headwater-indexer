@@ -78,3 +78,4 @@ dashboard._
 - `npm test` currently has no tests for this repo specifically; the
   detection logic it ports (`circularFunding.js`, `fanOut.js`) is tested
   in `headwater/`'s own 106-test suite.
+# Redeploy trigger
