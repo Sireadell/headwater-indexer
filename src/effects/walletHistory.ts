@@ -26,6 +26,16 @@ const HYPERSYNC_URL = "https://monad.hypersync.xyz";
 const AUSD_ADDRESS = "0x00000000efe302beaa2b3e6e1b18d08d69a9012a";
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
+// Both lookups below talk to HyperSync, which needs a token. Without one
+// there is nothing useful to do, so they return "found nothing" rather
+// than throwing or hanging on a request that cannot succeed. This also
+// keeps the test suite offline and deterministic: tests run with no token
+// and exercise the handler logic without reaching the network.
+function hypersyncToken(): string | undefined {
+  const token = process.env.ENVIO_API_TOKEN;
+  return token && token.length > 0 ? token : undefined;
+}
+
 function addressToTopic(address: string): string {
   return "0x" + address.toLowerCase().replace(/^0x/, "").padStart(64, "0");
 }
@@ -66,12 +76,12 @@ export const getWalletAusdHistory = createEffect(
     cache: true,
   },
   async ({ input }): Promise<WalletTransferRecord[]> => {
+    const token = hypersyncToken();
+    if (token === undefined) return [];
+
     const wallet = input.toLowerCase();
     const walletTopic = addressToTopic(wallet);
-    const client = new HypersyncClient({
-      url: HYPERSYNC_URL,
-      apiToken: process.env.ENVIO_API_TOKEN!,
-    });
+    const client = new HypersyncClient({ url: HYPERSYNC_URL, apiToken: token });
 
     const query: Query = {
       fromBlock: 0,
@@ -161,11 +171,11 @@ export const getWalletFirstActivity = createEffect(
     cache: true,
   },
   async ({ input }): Promise<{ blockNumber: number; timestamp: number } | null> => {
+    const token = hypersyncToken();
+    if (token === undefined) return null;
+
     const wallet = input.toLowerCase();
-    const client = new HypersyncClient({
-      url: HYPERSYNC_URL,
-      apiToken: process.env.ENVIO_API_TOKEN!,
-    });
+    const client = new HypersyncClient({ url: HYPERSYNC_URL, apiToken: token });
 
     const query: Query = {
       fromBlock: 0,

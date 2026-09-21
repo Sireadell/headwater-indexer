@@ -346,16 +346,22 @@ async function registerFundedReviewer(
 // one agent alone.
 async function updateReviewCadence(
   context: any,
+  agentId: string,
   reviewerAddress: string,
   timestamp: number,
 ): Promise<void> {
-  const existing = await context.ReviewCadence.get(reviewerAddress);
+  // Keyed per agent, not per wallet: a scripted burst on one agent is
+  // separated from the next by a long pause while the operator moves on,
+  // and averaging those pauses in hides the regularity inside each burst.
+  const cadenceId = `${agentId}-${reviewerAddress}`;
+  const existing = await context.ReviewCadence.get(cadenceId);
 
   if (existing === undefined) {
     // First review seen for this wallet: no interval exists yet, so
     // there is nothing to measure until the next one arrives.
     context.ReviewCadence.set({
-      id: reviewerAddress,
+      id: cadenceId,
+      agent_id: agentId,
       reviewer_id: reviewerAddress,
       lastReviewTimestamp: timestamp,
       reviewCount: 1,
@@ -400,7 +406,8 @@ async function updateReviewCadence(
   const coefficientOfVariation = mean > 0 ? stdDev / mean : 0;
 
   context.ReviewCadence.set({
-    id: reviewerAddress,
+    id: cadenceId,
+    agent_id: agentId,
     reviewer_id: reviewerAddress,
     lastReviewTimestamp: timestamp,
     reviewCount: existing.reviewCount + 1,
@@ -529,7 +536,7 @@ indexer.onEvent(
     };
     context.Feedback.set(feedback);
 
-    await updateReviewCadence(context, reviewerAddress, event.block.timestamp);
+    await updateReviewCadence(context, agentId, reviewerAddress, event.block.timestamp);
 
     // Re-read: the backfill above may have created FundingTransfer rows
     // touching this reviewer, but distinctAgentIds only changes here.

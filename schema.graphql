@@ -118,21 +118,26 @@ type FunderFanOut {
   thresholdMet: Boolean!
 }
 
-# Review-timing cadence. A human writing genuine reviews leaves ragged
-# gaps between them: minutes, then hours, then days. A script on a loop
-# leaves near-identical gaps. This measures that raggedness directly via
-# the coefficient of variation (standard deviation / mean) of the gaps
-# between a reviewer's consecutive feedback events.
+# Review-timing cadence, measured per reviewer PER AGENT.
 #
-# Low CV means the gaps barely vary, which is what automation looks like.
-# Observed on a real flagged cluster: one wallet posted ten reviews spaced
-# 48-82 seconds apart (CV 0.16), another 48-57 seconds apart (CV 0.06).
-# Ordinary human review behaviour sits far above 1.0.
+# A human writing genuine reviews leaves ragged gaps between them:
+# minutes, then hours, then days. A script on a loop leaves near-identical
+# gaps. This measures that raggedness via the coefficient of variation
+# (standard deviation / mean) of the gaps between consecutive reviews.
 #
-# Running totals are kept so this stays O(1) per event -- no timestamp
-# array grows without bound, and nothing needs a rescan.
+# Scoped to one agent deliberately. Measured across a wallet's whole
+# history instead, a scripted burst on one agent is separated from the
+# next burst by a long pause while the operator moves on, and those
+# pauses swamp the regularity inside each burst. Checked against live
+# data: one wallet scored 0.16 on a single agent, which flags, but 1.73
+# across all six agents it reviewed, which does not. The fraud is "this
+# wallet worked through this agent on a timer", so that is the scope.
+#
+# Running totals keep this O(1) per event -- no timestamp array grows
+# without bound, and nothing needs a rescan.
 type ReviewCadence {
-  id: ID! # reviewer address
+  id: ID! # agentId-reviewerAddress
+  agent: Agent!
   reviewer: Reviewer!
   lastReviewTimestamp: Int!
   reviewCount: Int!

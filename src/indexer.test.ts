@@ -264,7 +264,8 @@ describe("Review-timing cadence", () => {
       });
     }
 
-    return indexer.ReviewCadence.getOrThrow(reviewer.toLowerCase());
+    // Cadence rows are keyed per agent, so the id is agentId-reviewer.
+    return indexer.ReviewCadence.getOrThrow(`153-${reviewer.toLowerCase()}`);
   };
 
   it("flags the machine-like cadence actually observed on-chain", async (t) => {
@@ -502,6 +503,136 @@ describe("Shared funder", () => {
     t.expect(
       shared.thresholdMet,
       "an exchange paying two reviewers among hundreds is not coordination",
+    ).toBe(false);
+  });
+});
+
+describe("Review-timing cadence, per-agent scoping", () => {
+  // Regression test for a real miss found in production. Wallet
+  // 0xe0554... posted ten reviews on agent 153 at 51-82 second gaps,
+  // visibly scripted, but went unflagged because cadence was measured
+  // across its whole history: it reviewed six agents, and the long
+  // pauses between each agent's burst swamped the regularity inside
+  // them. Live scores were 0.16 for agent 153 alone versus 1.73 across
+  // all six. The reviews are the real gaps read off the live indexer.
+  const agent153Gaps = [79, 66, 51, 59, 76, 82, 62, 79, 58];
+  const PAUSE_BETWEEN_AGENTS = 3_000;
+
+  it("flags a scripted burst that a whole-history average would hide", async (t) => {
+    const indexer = createTestIndexer();
+    const reviewer = Addresses.mockAddresses[0]!;
+    let ts = 1_771_091_270;
+    let index = 0n;
+
+    const review = (agentId: bigint, timestamp: number, feedbackIndex: bigint) => ({
+      contract: "ReputationRegistry" as const,
+      event: "NewFeedback" as const,
+      block: { timestamp },
+      params: {
+        agentId,
+        clientAddress: reviewer as `0x${string}`,
+        feedbackIndex,
+        value: 90n,
+        valueDecimals: 0n,
+        indexedTag1: "",
+        tag1: "",
+        tag2: "",
+        endpoint: "",
+        feedbackURI: "",
+        feedbackHash: "0x" + "00".repeat(32),
+      },
+    });
+
+    // Burst on agent 153, a long pause, then the same burst on agent 154:
+    // one operator working through a list.
+    const events = [review(153n, ts, index++)];
+    for (const gap of agent153Gaps) {
+      ts += gap;
+      events.push(review(153n, ts, index++));
+    }
+    ts += PAUSE_BETWEEN_AGENTS;
+    events.push(review(154n, ts, index++));
+    for (const gap of agent153Gaps) {
+      ts += gap;
+      events.push(review(154n, ts, index++));
+    }
+
+    for (const event of events) {
+      await indexer.process({ chains: { [CHAIN_ID]: { simulate: [event] } } });
+    }
+
+    const on153 = await indexer.ReviewCadence.getOrThrow(`153-${reviewer.toLowerCase()}`);
+    const on154 = await indexer.ReviewCadence.getOrThrow(`154-${reviewer.toLowerCase()}`);
+
+    t.expect(on153.intervalCount).toBe(agent153Gaps.length);
+    t.expect(
+      on153.automationSuspected,
+      "the burst on agent 153 is scripted and must be flagged",
+    ).toBe(true);
+    t.expect(
+      on154.automationSuspected,
+      "the identical burst on agent 154 must be flagged too",
+    ).toBe(true);
+
+    // The pause between the two bursts is longer than any gap inside
+    // them. Averaged into one score it would dominate, which is exactly
+    // how the production miss happened; per-agent rows never see it.
+    t.expect(
+      on153.maxIntervalSeconds,
+      "no cadence row should have absorbed the cross-agent pause",
+    ).toBeLessThan(PAUSE_BETWEEN_AGENTS);
+    t.expect(on154.maxIntervalSeconds).toBeLessThan(PAUSE_BETWEEN_AGENTS);
+  });
+
+  it("keeps one agent's verdict independent of another's", async (t) => {
+    const indexer = createTestIndexer();
+    const reviewer = Addresses.mockAddresses[1]!;
+    let ts = 1_771_200_000;
+    let index = 0n;
+
+    const review = (agentId: bigint, timestamp: number, feedbackIndex: bigint) => ({
+      contract: "ReputationRegistry" as const,
+      event: "NewFeedback" as const,
+      block: { timestamp },
+      params: {
+        agentId,
+        clientAddress: reviewer as `0x${string}`,
+        feedbackIndex,
+        value: 90n,
+        valueDecimals: 0n,
+        indexedTag1: "",
+        tag1: "",
+        tag2: "",
+        endpoint: "",
+        feedbackURI: "",
+        feedbackHash: "0x" + "00".repeat(32),
+      },
+    });
+
+    // Scripted on agent 200, genuinely irregular on agent 201.
+    const events = [review(200n, ts, index++)];
+    for (const gap of [60, 61, 59, 60, 62, 58, 61, 60, 59]) {
+      ts += gap;
+      events.push(review(200n, ts, index++));
+    }
+    let humanTs = ts;
+    events.push(review(201n, humanTs, index++));
+    for (const gap of [340, 86_400, 1_200, 43_200, 900, 172_800]) {
+      humanTs += gap;
+      events.push(review(201n, humanTs, index++));
+    }
+
+    for (const event of events) {
+      await indexer.process({ chains: { [CHAIN_ID]: { simulate: [event] } } });
+    }
+
+    const scripted = await indexer.ReviewCadence.getOrThrow(`200-${reviewer.toLowerCase()}`);
+    const human = await indexer.ReviewCadence.getOrThrow(`201-${reviewer.toLowerCase()}`);
+
+    t.expect(scripted.automationSuspected, "the scripted agent must flag").toBe(true);
+    t.expect(
+      human.automationSuspected,
+      "the same wallet reviewing another agent irregularly must not be dragged into a flag",
     ).toBe(false);
   });
 });
