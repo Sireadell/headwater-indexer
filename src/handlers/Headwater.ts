@@ -15,12 +15,7 @@ import {
   type WalletFunder,
   type FunderProfile,
 } from "envio";
-import {
-  getWalletAusdHistory,
-  getWalletOrigin,
-  type WalletOrigin,
-  type WalletTransferRecord,
-} from "../effects/walletHistory";
+import { getWalletOrigin, type WalletOrigin } from "../effects/walletHistory";
 
 const NANSEN_API_KEY = process.env.NANSEN_API_KEY;
 const NANSEN_BASE_URL = "https://api.nansen.ai/v2";
@@ -302,7 +297,6 @@ async function recordFunderEdge(
 async function recordWalletOrigin(
   context: any,
   reviewerAddress: string,
-  ausdHistory: WalletTransferRecord[],
 ): Promise<void> {
   const wallet = norm(reviewerAddress);
   const existing = await context.WalletBirth.get(wallet);
@@ -339,32 +333,6 @@ async function recordWalletOrigin(
     }
   }
 
-  // Token funders, from the AUSD history already fetched for this wallet.
-  // Needed as a separate path because an ERC-20 transfer's transaction
-  // `to` is the token contract, so none of this is visible above.
-  //
-  // Token amounts are never classified as dust: ERC-20 decimals vary per
-  // contract and resolving them would cost a call per candidate. That is
-  // a stated limit, not an oversight.
-  const earliestByFunder = new Map<string, WalletTransferRecord>();
-  for (const record of ausdHistory) {
-    if (norm(record.to) !== wallet) continue;
-    const from = norm(record.from);
-    if (from === wallet) continue;
-    const seen = earliestByFunder.get(from);
-    if (seen === undefined || record.timestamp < seen.timestamp) {
-      earliestByFunder.set(from, record);
-    }
-  }
-  for (const [funder, record] of earliestByFunder) {
-    await recordFunderEdge(context, wallet, funder, {
-      firstFundedBlock: record.blockNumber,
-      firstFundedTimestamp: record.timestamp,
-      valueRaw: record.value,
-      source: "ausd",
-      isDust: false,
-    });
-  }
 }
 
 
@@ -530,52 +498,6 @@ async function ensureReviewer(context: any, address: string): Promise<Reviewer> 
   return reviewer;
 }
 
-// Only called for a wallet's FIRST-ever appearance as a Reviewer (see the
-// NewFeedback handler below) -- a rare event, hundreds of times total,
-// not per-transfer, so the deep HyperSync query this triggers stays cheap
-// in aggregate even though each individual query goes back to genesis.
-async function backfillReviewerFundingHistory(
-  context: any,
-  reviewerAddress: string,
-): Promise<WalletTransferRecord[]> {
-  let history: WalletTransferRecord[];
-  try {
-    history = await context.effect(getWalletAusdHistory, reviewerAddress);
-  } catch (err) {
-    console.log(`Funding-history backfill skipped for ${reviewerAddress}`);
-    return [];
-  }
-  for (const record of history) {
-    await processFundingTransfer(
-      context,
-      record.from,
-      record.to,
-      BigInt(record.value),
-      record.blockNumber,
-      record.timestamp,
-      record.txHash,
-      record.logIndex,
-    );
-  }
-
-  // Everything above is history for a wallet we now know is a reviewer,
-  // so any inbound transfer in it is someone who funded a reviewer --
-  // including funding that landed long before the first review, which is
-  // precisely the pattern a short live window would miss.
-  const normalisedReviewer = norm(reviewerAddress);
-  for (const record of history) {
-    if (norm(record.to) === normalisedReviewer) {
-      await registerFundedReviewer(
-        context,
-        record.from,
-        normalisedReviewer,
-        record.timestamp,
-      );
-    }
-  }
-
-  return history;
-}
 
 indexer.onEvent(
   { contract: "IdentityRegistry", event: "Registered" },
@@ -605,16 +527,24 @@ indexer.onEvent(
     const isNewReviewer = (await context.Reviewer.get(reviewerAddress)) === undefined;
     await ensureReviewer(context, reviewerAddress);
 
-    // The actual fraud shape this tool exists to catch -- fund a wallet
-    // quietly, wait, then use it to review later -- specifically defeats
-    // a short rolling funding window, because the funding happens BEFORE
-    // the wallet is "known" to watch. Fix: the moment a wallet is first
-    // discovered as a reviewer, pull its full AUSD history directly via
-    // HyperSync (cached forever, so this never repeats for the same
-    // wallet), instead of only relying on the live indexed window.
+    // The fraud shape this tool exists to catch -- fund a wallet quietly,
+    // wait, then review with it later -- defeats any short rolling
+    // window, because the funding happens BEFORE the wallet is known to
+    // watch. So the moment a wallet is first seen reviewing, its full
+    // history is pulled directly via HyperSync, cached so it never
+    // repeats for that wallet.
+    //
+    // This previously ALSO deep-scanned each reviewer's entire AUSD
+    // history. That was removed after measuring it: across 4,476
+    // reviewers it returned zero results, because reviewers on this
+    // registry do not transact in AUSD. Spot-checked directly against
+    // HyperSync to confirm genuine absence rather than a bug. It cost
+    // one of the two rate-limited deep queries per wallet, roughly half
+    // of total sync time, for nothing. Live AUSD indexing still runs, so
+    // token funding is still caught going forward; only the fruitless
+    // historical rescan is gone.
     if (isNewReviewer) {
-      const history = await backfillReviewerFundingHistory(context, reviewerAddress);
-      await recordWalletOrigin(context, reviewerAddress, history);
+      await recordWalletOrigin(context, reviewerAddress);
     }
 
     const feedback: Feedback = {
