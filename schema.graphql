@@ -148,3 +148,26 @@ type ReviewCadence {
   # gaps are tight enough to be implausible for a human.
   automationSuspected: Boolean!
 }
+
+# One wallet quietly funding several different reviewers.
+#
+# This is the gap the other two funding signals leave open. Circular
+# funding needs money flowing back the other way. Fan-out only fires at
+# 15+ recipients, and exists to recognise exchanges so they can be
+# excluded. Neither catches the ordinary case: one wallet funds three
+# reviewers, who then review the same agent.
+#
+# Exchanges do pay reviewers, incidentally, among thousands of others.
+# Rather than depend on an external label service, this uses the
+# indexer's own fan-out result as the exclusion: a funder already shaped
+# like an exchange is recorded but not flagged.
+type SharedFunder {
+  id: ID! # funder address
+  funder: String!
+  fundedReviewers: [String!]!
+  fundedReviewerCount: Int!
+  firstFundingTimestamp: Int!
+  lastFundingTimestamp: Int!
+  exchangeShaped: Boolean!
+  thresholdMet: Boolean!
+}

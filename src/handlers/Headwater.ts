@@ -10,6 +10,7 @@ import {
   type CircularFunding,
   type FunderFanOut,
   type ReviewCadence,
+  type SharedFunder,
 } from "envio";
 import { getWalletAusdHistory, type WalletTransferRecord } from "../effects/walletHistory";
 
@@ -41,6 +42,14 @@ const MAX_STORED_RECIPIENTS = 200;
 //
 // MIN_CADENCE_INTERVALS guards against calling automation on a handful
 // of points, where a tight spread can happen by chance.
+// A funder paying two or more distinct reviewers is the shape this
+// signal exists to catch. Two is deliberately low: the other funding
+// signals already cover the high-volume end, and the coordinated case
+// this targets is small by design -- a handful of wallets is enough to
+// swing an agent's reputation.
+const MIN_SHARED_FUNDER_REVIEWERS = 2;
+const MAX_STORED_FUNDED_REVIEWERS = 200;
+
 const MIN_CADENCE_INTERVALS = 5;
 const MAX_CADENCE_CV = 0.35;
 
@@ -215,6 +224,14 @@ async function processFundingTransfer(
     thresholdMet,
   });
 
+  // If the recipient has already left feedback, this transfer is someone
+  // funding a reviewer. The mirror case -- funded first, reviewed later --
+  // is handled by the backfill path instead.
+  const recipient = await context.Reviewer.get(toAddr);
+  if (recipient !== undefined && recipient.distinctAgentCount > 0) {
+    await registerFundedReviewer(context, fromAddr, toAddr, timestamp);
+  }
+
   // Nansen: only store a label for wallets not already known-legitimate,
   // so exchanges/market-makers don't pollute the suspicious-wallet table.
   // Cached lookup avoids re-calling Nansen for a wallet already checked.
@@ -222,6 +239,69 @@ async function processFundingTransfer(
   if (nansen && !isLegitimateActor(nansen)) {
     context.WalletLabel.set(nansen);
   }
+}
+
+// Records that `funder` paid `reviewerAddress`, a wallet known to have
+// left feedback. Called from both directions so ordering does not
+// matter: the backfill path covers wallets funded before they ever
+// reviewed, and the live transfer path covers wallets funded after.
+async function registerFundedReviewer(
+  context: any,
+  funderRaw: string,
+  reviewerRaw: string,
+  timestamp: number,
+): Promise<void> {
+  const funder = norm(funderRaw);
+  const reviewer = norm(reviewerRaw);
+
+  // A wallet moving its own money between its own addresses is not
+  // someone funding a reviewer.
+  if (funder === reviewer) return;
+
+  const existing = await context.SharedFunder.get(funder);
+
+  // Count each funded reviewer once, however many times they were paid.
+  // Ten transfers to one wallet is one funded reviewer, not ten.
+  if (existing !== undefined && existing.fundedReviewers.includes(reviewer)) {
+    context.SharedFunder.set({
+      ...existing,
+      firstFundingTimestamp: Math.min(existing.firstFundingTimestamp, timestamp),
+      lastFundingTimestamp: Math.max(existing.lastFundingTimestamp, timestamp),
+    });
+    return;
+  }
+
+  const fundedReviewers = existing ? [...existing.fundedReviewers] : [];
+  if (fundedReviewers.length < MAX_STORED_FUNDED_REVIEWERS) {
+    fundedReviewers.push(reviewer);
+  }
+  // Stays exact past the array cap, same approach as FunderFanOut.
+  const fundedReviewerCount = (existing ? existing.fundedReviewerCount : 0) + 1;
+
+  // An exchange pays thousands of wallets, some of whom happen to review
+  // agents. Flagging that would be a false positive on the largest,
+  // most visible funders on the chain. The external label service that
+  // was meant to catch this is not operational, so the indexer's own
+  // fan-out result stands in: a funder already shaped like a payment
+  // processor is recorded but not flagged.
+  const fanOut = await context.FunderFanOut.get(funder);
+  const exchangeShaped = fanOut !== undefined && fanOut.thresholdMet;
+
+  context.SharedFunder.set({
+    id: funder,
+    funder,
+    fundedReviewers,
+    fundedReviewerCount,
+    firstFundingTimestamp: existing
+      ? Math.min(existing.firstFundingTimestamp, timestamp)
+      : timestamp,
+    lastFundingTimestamp: existing
+      ? Math.max(existing.lastFundingTimestamp, timestamp)
+      : timestamp,
+    exchangeShaped,
+    thresholdMet:
+      fundedReviewerCount >= MIN_SHARED_FUNDER_REVIEWERS && !exchangeShaped,
+  });
 }
 
 // Updates a reviewer's running review-timing statistics with one new
@@ -339,6 +419,22 @@ async function backfillReviewerFundingHistory(context: any, reviewerAddress: str
       record.txHash,
       record.logIndex,
     );
+  }
+
+  // Everything above is history for a wallet we now know is a reviewer,
+  // so any inbound transfer in it is someone who funded a reviewer --
+  // including funding that landed long before the first review, which is
+  // precisely the pattern a short live window would miss.
+  const normalisedReviewer = norm(reviewerAddress);
+  for (const record of history) {
+    if (norm(record.to) === normalisedReviewer) {
+      await registerFundedReviewer(
+        context,
+        record.from,
+        normalisedReviewer,
+        record.timestamp,
+      );
+    }
   }
 }
 

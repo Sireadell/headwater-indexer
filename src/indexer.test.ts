@@ -326,3 +326,182 @@ describe("Review-timing cadence", () => {
     t.expect(cadence.automationSuspected).toBe(false);
   });
 });
+
+describe("Shared funder", () => {
+  const feedbackFrom = (reviewer: string, agentId: bigint, feedbackIndex: bigint) => ({
+    contract: "ReputationRegistry" as const,
+    event: "NewFeedback" as const,
+    params: {
+      agentId,
+      clientAddress: reviewer as `0x${string}`,
+      feedbackIndex,
+      value: 90n,
+      valueDecimals: 0n,
+      indexedTag1: "",
+      tag1: "",
+      tag2: "",
+      endpoint: "",
+      feedbackURI: "",
+      feedbackHash: "0x" + "00".repeat(32),
+    },
+  });
+
+  const transfer = (from: string, to: string, block: number, logIndex: number) => ({
+    contract: "AUSD" as const,
+    event: "Transfer" as const,
+    params: { from: from as `0x${string}`, to: to as `0x${string}`, value: 5_000_000n },
+    block: { number: block },
+    logIndex,
+  });
+
+  it("flags one wallet that funded two separate reviewers", async (t) => {
+    const indexer = createTestIndexer();
+    const funder = Addresses.mockAddresses[0]!;
+    const reviewerA = Addresses.mockAddresses[1]!;
+    const reviewerB = Addresses.mockAddresses[2]!;
+
+    // Both wallets review first, so they are known reviewers by the time
+    // the funding lands.
+    await indexer.process({
+      chains: {
+        [CHAIN_ID]: {
+          simulate: [feedbackFrom(reviewerA, 1n, 0n), feedbackFrom(reviewerB, 1n, 0n)],
+        },
+      },
+    });
+    await indexer.process({
+      chains: {
+        [CHAIN_ID]: {
+          simulate: [
+            transfer(funder, reviewerA, AUSD_TEST_BLOCK, 0),
+            transfer(funder, reviewerB, AUSD_TEST_BLOCK + 1, 1),
+          ],
+        },
+      },
+    });
+
+    const shared = await indexer.SharedFunder.getOrThrow(funder.toLowerCase());
+    t.expect(shared.fundedReviewerCount).toBe(2);
+    t.expect(
+      shared.thresholdMet,
+      "one wallet bankrolling two different reviewers is the pattern this exists to catch",
+    ).toBe(true);
+  });
+
+  it("does not flag a wallet that funded only one reviewer", async (t) => {
+    const indexer = createTestIndexer();
+    const funder = Addresses.mockAddresses[3]!;
+    const reviewer = Addresses.mockAddresses[4]!;
+
+    await indexer.process({
+      chains: { [CHAIN_ID]: { simulate: [feedbackFrom(reviewer, 1n, 0n)] } },
+    });
+    await indexer.process({
+      chains: { [CHAIN_ID]: { simulate: [transfer(funder, reviewer, AUSD_TEST_BLOCK, 0)] } },
+    });
+
+    const shared = await indexer.SharedFunder.getOrThrow(funder.toLowerCase());
+    t.expect(shared.fundedReviewerCount).toBe(1);
+    t.expect(
+      shared.thresholdMet,
+      "funding a single reviewer is ordinary and must not be flagged",
+    ).toBe(false);
+  });
+
+  it("counts a reviewer once however many times they are paid", async (t) => {
+    const indexer = createTestIndexer();
+    const funder = Addresses.mockAddresses[5]!;
+    const reviewer = Addresses.mockAddresses[6]!;
+
+    await indexer.process({
+      chains: { [CHAIN_ID]: { simulate: [feedbackFrom(reviewer, 1n, 0n)] } },
+    });
+    await indexer.process({
+      chains: {
+        [CHAIN_ID]: {
+          simulate: [
+            transfer(funder, reviewer, AUSD_TEST_BLOCK, 0),
+            transfer(funder, reviewer, AUSD_TEST_BLOCK + 1, 1),
+            transfer(funder, reviewer, AUSD_TEST_BLOCK + 2, 2),
+          ],
+        },
+      },
+    });
+
+    const shared = await indexer.SharedFunder.getOrThrow(funder.toLowerCase());
+    t.expect(
+      shared.fundedReviewerCount,
+      "three payments to the same wallet is one funded reviewer, not three",
+    ).toBe(1);
+    t.expect(shared.thresholdMet).toBe(false);
+  });
+
+  it("does not flag an exchange-shaped funder that pays reviewers incidentally", async (t) => {
+    const indexer = createTestIndexer();
+    const exchange = Addresses.mockAddresses[7]!;
+    const reviewerA = Addresses.mockAddresses[8]!;
+    const reviewerB = Addresses.mockAddresses[9]!;
+
+    // Registry events go first. The harness rebuilds chain state on every
+    // process() call and rejects any contract whose configured start
+    // block sits below that state, so leading with AUSD would strand
+    // every later call above AUSD's own start block.
+    await indexer.process({
+      chains: {
+        [CHAIN_ID]: {
+          simulate: [feedbackFrom(reviewerA, 1n, 0n), feedbackFrom(reviewerB, 1n, 0n)],
+        },
+      },
+    });
+
+    // Genuine fan-out shape: many distinct recipients spread over more
+    // than the 25 hours the fan-out signal requires, which is what marks
+    // a payment processor rather than a coordinated funder. The two
+    // reviewer payments are last in the same batch, so the fan-out
+    // verdict already exists when they are evaluated.
+    const payouts = Array.from({ length: 20 }, (_, i) => ({
+      contract: "AUSD" as const,
+      event: "Transfer" as const,
+      params: {
+        from: exchange as `0x${string}`,
+        to: ("0x" + (i + 200).toString(16).padStart(40, "0")) as `0x${string}`,
+        value: 5_000_000n,
+      },
+      block: { number: AUSD_TEST_BLOCK + i, timestamp: 1_789_000_000 + i * 20_000 },
+      logIndex: i,
+    }));
+
+    await indexer.process({
+      chains: {
+        [CHAIN_ID]: {
+          simulate: [
+            ...payouts,
+            // Log indices must not collide with the payouts above: events
+            // in one batch can share a synthetic transaction hash, and
+            // txHash+logIndex is the transfer's identity, so a repeat
+            // index would be discarded as an already-processed transfer.
+            {
+              ...transfer(exchange, reviewerA, AUSD_TEST_BLOCK + 100, 100),
+              block: { number: AUSD_TEST_BLOCK + 100, timestamp: 1_789_500_000 },
+            },
+            {
+              ...transfer(exchange, reviewerB, AUSD_TEST_BLOCK + 101, 101),
+              block: { number: AUSD_TEST_BLOCK + 101, timestamp: 1_789_500_100 },
+            },
+          ],
+        },
+      },
+    });
+
+    const fanOut = await indexer.FunderFanOut.getOrThrow(exchange.toLowerCase());
+    t.expect(fanOut.thresholdMet, "test setup: this funder must look like an exchange").toBe(true);
+
+    const shared = await indexer.SharedFunder.getOrThrow(exchange.toLowerCase());
+    t.expect(shared.fundedReviewerCount, "the funding is still recorded").toBe(2);
+    t.expect(shared.exchangeShaped).toBe(true);
+    t.expect(
+      shared.thresholdMet,
+      "an exchange paying two reviewers among hundreds is not coordination",
+    ).toBe(false);
+  });
+});
