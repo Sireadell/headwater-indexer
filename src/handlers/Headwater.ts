@@ -12,10 +12,12 @@ import {
   type ReviewCadence,
   type SharedFunder,
   type WalletBirth,
+  type WalletFunder,
 } from "envio";
 import {
   getWalletAusdHistory,
-  getWalletFirstActivity,
+  getWalletOrigin,
+  type WalletOrigin,
   type WalletTransferRecord,
 } from "../effects/walletHistory";
 
@@ -246,35 +248,84 @@ async function processFundingTransfer(
   }
 }
 
-// Records when a reviewer wallet first appeared on chain. Runs once per
-// wallet, at the moment it is first seen reviewing, and the underlying
-// lookup is cached so a redeploy does not re-query it.
-async function recordWalletBirth(
+// Records when a reviewer wallet first appeared on chain, and who paid
+// into it. Runs once per wallet at the moment it is first seen
+// reviewing; the underlying lookup is cached so a redeploy does not
+// re-query it.
+async function recordWalletOrigin(
   context: any,
   reviewerAddress: string,
+  ausdHistory: WalletTransferRecord[],
 ): Promise<void> {
   const wallet = norm(reviewerAddress);
   const existing = await context.WalletBirth.get(wallet);
   if (existing !== undefined) return;
 
-  let birth: { blockNumber: number; timestamp: number } | null;
+  let origin: WalletOrigin | null = null;
   try {
-    birth = await context.effect(getWalletFirstActivity, wallet);
+    origin = await context.effect(getWalletOrigin, wallet);
   } catch (err) {
-    // A failed lookup must not be written as a real birth, or the wallet
-    // would be permanently recorded as born at block zero.
-    console.log(`Wallet birth lookup skipped for ${wallet}`);
+    // A failed lookup must write nothing, or a transient error would be
+    // baked in permanently as a birth at block zero.
+    console.log(`Wallet origin lookup skipped for ${wallet}`);
     return;
   }
 
   context.WalletBirth.set({
     id: wallet,
     wallet,
-    firstSeenBlock: birth ? birth.blockNumber : 0,
-    firstSeenTimestamp: birth ? birth.timestamp : 0,
-    foundActivity: birth !== null,
+    firstSeenBlock: origin ? origin.firstSeenBlock : 0,
+    firstSeenTimestamp: origin ? origin.firstSeenTimestamp : 0,
+    foundActivity: origin !== null,
   });
+
+  // Native funders, as found above.
+  if (origin) {
+    for (const f of origin.funders) {
+      context.WalletFunder.set({
+        id: `${wallet}-${f.funder}`,
+        wallet,
+        funder: f.funder,
+        firstFundedBlock: f.blockNumber,
+        firstFundedTimestamp: f.timestamp,
+        valueRaw: f.valueWei,
+        source: "native",
+        isDust: f.isDust,
+      });
+    }
+  }
+
+  // Token funders, from the AUSD history already fetched for this wallet.
+  // Needed as a separate path because an ERC-20 transfer's transaction
+  // `to` is the token contract, so none of this is visible above.
+  //
+  // Token amounts are never classified as dust: ERC-20 decimals vary per
+  // contract and resolving them would cost a call per candidate. That is
+  // a stated limit, not an oversight.
+  const earliestByFunder = new Map<string, WalletTransferRecord>();
+  for (const record of ausdHistory) {
+    if (norm(record.to) !== wallet) continue;
+    const from = norm(record.from);
+    if (from === wallet) continue;
+    const seen = earliestByFunder.get(from);
+    if (seen === undefined || record.timestamp < seen.timestamp) {
+      earliestByFunder.set(from, record);
+    }
+  }
+  for (const [funder, record] of earliestByFunder) {
+    context.WalletFunder.set({
+      id: `${wallet}-${funder}`,
+      wallet,
+      funder,
+      firstFundedBlock: record.blockNumber,
+      firstFundedTimestamp: record.timestamp,
+      valueRaw: record.value,
+      source: "ausd",
+      isDust: false,
+    });
+  }
 }
+
 
 // Records that `funder` paid `reviewerAddress`, a wallet known to have
 // left feedback. Called from both directions so ordering does not
@@ -442,13 +493,16 @@ async function ensureReviewer(context: any, address: string): Promise<Reviewer> 
 // NewFeedback handler below) -- a rare event, hundreds of times total,
 // not per-transfer, so the deep HyperSync query this triggers stays cheap
 // in aggregate even though each individual query goes back to genesis.
-async function backfillReviewerFundingHistory(context: any, reviewerAddress: string): Promise<void> {
+async function backfillReviewerFundingHistory(
+  context: any,
+  reviewerAddress: string,
+): Promise<WalletTransferRecord[]> {
   let history: WalletTransferRecord[];
   try {
     history = await context.effect(getWalletAusdHistory, reviewerAddress);
   } catch (err) {
     console.log(`Funding-history backfill skipped for ${reviewerAddress}`);
-    return;
+    return [];
   }
   for (const record of history) {
     await processFundingTransfer(
@@ -478,6 +532,8 @@ async function backfillReviewerFundingHistory(context: any, reviewerAddress: str
       );
     }
   }
+
+  return history;
 }
 
 indexer.onEvent(
@@ -516,8 +572,8 @@ indexer.onEvent(
     // HyperSync (cached forever, so this never repeats for the same
     // wallet), instead of only relying on the live indexed window.
     if (isNewReviewer) {
-      await backfillReviewerFundingHistory(context, reviewerAddress);
-      await recordWalletBirth(context, reviewerAddress);
+      const history = await backfillReviewerFundingHistory(context, reviewerAddress);
+      await recordWalletOrigin(context, reviewerAddress, history);
     }
 
     const feedback: Feedback = {

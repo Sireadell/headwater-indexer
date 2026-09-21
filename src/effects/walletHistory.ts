@@ -144,33 +144,74 @@ export const getWalletAusdHistory = createEffect(
   },
 );
 
-// When a wallet first appeared on chain at all.
+// When a wallet first appeared on chain, and who paid into it.
 //
-// Wallets that were provisioned together by one operator tend to be born
-// together: created in a batch, minutes apart, then held until needed.
-// Genuine independent reviewers have no reason to share a birthday.
+// Both answers come from one scan because they need the same data. A
+// separate pass would double the HyperSync cost per wallet for nothing.
 //
-// "Born" here means the earliest block in which the address appears in
-// any transaction, sending or receiving. Receiving comes first for a
-// fresh EOA, since it cannot send anything until it has been funded for
-// gas, so both directions are queried rather than just outbound.
+// WALLET BIRTH: wallets provisioned together by one operator tend to be
+// born together, minutes apart, then held until needed. Independent
+// reviewers have no reason to share a birthday. "Born" means the
+// earliest block the address appears in any transaction, either
+// direction: a fresh EOA cannot send before it has been funded for gas,
+// so its first appearance is as a recipient.
 //
-// Like the funding backfill above, this runs once per wallet at the
-// moment it is first seen as a reviewer, and is cached forever.
-export const getWalletFirstActivity = createEffect(
+// NATIVE FUNDERS: who sent this wallet its native balance. Two lessons
+// carried over from telegraph-sentinel's fundingRelationship.js, both
+// of which were caught against live data there:
+//
+//   1. This path sees NATIVE transfers only. For an ERC-20 transfer the
+//      transaction's `to` is the token contract, never the recipient, so
+//      token funding is invisible here by construction. The AUSD side is
+//      covered separately from getWalletAusdHistory rather than pretended
+//      at here.
+//
+//   2. The earliest funder is often not the real one. A trivial gas
+//      top-up arrives first and, if collapsed to a single winner, hides
+//      whoever actually capitalised the wallet. So every inbound funder
+//      is returned, each marked dust or not, and the caller decides.
+//      Threshold is 0.01 native, which comfortably covers real gas
+//      funding (typically 0.001-0.01) without needing a price oracle.
+const NATIVE_DUST_THRESHOLD_WEI = 10_000_000_000_000_000n;
+
+export interface WalletOrigin {
+  firstSeenBlock: number;
+  firstSeenTimestamp: number;
+  funders: {
+    funder: string;
+    blockNumber: number;
+    timestamp: number;
+    valueWei: string;
+    isDust: boolean;
+  }[];
+}
+
+export const getWalletOrigin = createEffect(
   {
-    name: "getWalletFirstActivity",
+    name: "getWalletOrigin",
     input: S.string,
     output: S.nullable(
       S.object((ctx) => ({
-        blockNumber: ctx.field("blockNumber", S.number),
-        timestamp: ctx.field("timestamp", S.number),
+        firstSeenBlock: ctx.field("firstSeenBlock", S.number),
+        firstSeenTimestamp: ctx.field("firstSeenTimestamp", S.number),
+        funders: ctx.field(
+          "funders",
+          S.array(
+            S.object((f) => ({
+              funder: f.field("funder", S.string),
+              blockNumber: f.field("blockNumber", S.number),
+              timestamp: f.field("timestamp", S.number),
+              valueWei: f.field("valueWei", S.string),
+              isDust: f.field("isDust", S.boolean),
+            })),
+          ),
+        ),
       })),
     ),
     rateLimit: { calls: 3, per: "second" },
     cache: true,
   },
-  async ({ input }): Promise<{ blockNumber: number; timestamp: number } | null> => {
+  async ({ input }): Promise<WalletOrigin | null> => {
     const token = hypersyncToken();
     if (token === undefined) return null;
 
@@ -181,34 +222,60 @@ export const getWalletFirstActivity = createEffect(
       fromBlock: 0,
       transactions: [{ from: [wallet] }, { to: [wallet] }],
       fieldSelection: {
-        transaction: ["BlockNumber", "From", "To"],
+        transaction: ["BlockNumber", "From", "To", "Value"],
         block: ["Number", "Timestamp"],
       },
     };
 
-    // Results come back ascending from fromBlock, so the first page that
-    // contains anything holds the earliest activity. A wallet created
-    // recently means many empty pages of older history first, hence the
-    // walk forward rather than a single call -- capped so one pathological
-    // case cannot stall the indexer.
     let fromBlock = 0;
+    let firstSeenBlock = Number.MAX_SAFE_INTEGER;
+    let firstSeenTimestamp = 0;
+    // Deduped by funder, keeping each one's earliest payment: a funder
+    // that paid a wallet fifty times is one funding relationship.
+    const byFunder = new Map<string, WalletOrigin["funders"][number]>();
+
     const MAX_PAGES = 50;
     for (let page = 0; page < MAX_PAGES; page++) {
       const res = await client.get({ ...query, fromBlock });
 
-      if (res.data.transactions.length > 0) {
-        let earliest = Number.MAX_SAFE_INTEGER;
-        for (const tx of res.data.transactions) {
-          if (tx.blockNumber !== undefined && tx.blockNumber < earliest) {
-            earliest = tx.blockNumber;
-          }
+      const timestampByBlock = new Map<number, number>();
+      for (const block of res.data.blocks) {
+        if (block.number !== undefined && block.timestamp !== undefined) {
+          timestampByBlock.set(block.number, block.timestamp);
         }
-        if (earliest !== Number.MAX_SAFE_INTEGER) {
-          const block = res.data.blocks.find((b) => b.number === earliest);
-          return {
-            blockNumber: earliest,
-            timestamp: block?.timestamp ?? 0,
-          };
+      }
+
+      for (const tx of res.data.transactions) {
+        if (tx.blockNumber === undefined) continue;
+        const timestamp = timestampByBlock.get(tx.blockNumber) ?? 0;
+
+        if (tx.blockNumber < firstSeenBlock) {
+          firstSeenBlock = tx.blockNumber;
+          firstSeenTimestamp = timestamp;
+        }
+
+        // Inbound only, and only where value actually moved.
+        const to = tx.to?.toLowerCase();
+        const from = tx.from?.toLowerCase();
+        if (to !== wallet || from === undefined || from === wallet) continue;
+
+        let valueWei: bigint;
+        try {
+          valueWei = BigInt(tx.value ?? "0");
+        } catch {
+          continue;
+        }
+        if (valueWei <= 0n) continue;
+
+        const existing = byFunder.get(from);
+        if (existing === undefined || timestamp < existing.timestamp) {
+          byFunder.set(from, {
+            funder: from,
+            blockNumber: tx.blockNumber,
+            timestamp,
+            valueWei: valueWei.toString(),
+            isDust: valueWei < NATIVE_DUST_THRESHOLD_WEI,
+          });
         }
       }
 
@@ -216,11 +283,15 @@ export const getWalletFirstActivity = createEffect(
       fromBlock = res.nextBlock;
     }
 
-    // Reaching here means no transaction was found for this address,
-    // which is possible for a wallet whose only on-chain presence is as a
-    // log participant. Returning null keeps that distinct from "born at
-    // block zero", which would otherwise read as the oldest wallet on the
+    // No transaction at all. Returning null keeps that distinct from
+    // "born at block zero", which would read as the oldest wallet on the
     // chain and cluster falsely with every other unknown.
-    return null;
+    if (firstSeenBlock === Number.MAX_SAFE_INTEGER) return null;
+
+    return {
+      firstSeenBlock,
+      firstSeenTimestamp,
+      funders: Array.from(byFunder.values()).sort((a, b) => a.timestamp - b.timestamp),
+    };
   },
 );

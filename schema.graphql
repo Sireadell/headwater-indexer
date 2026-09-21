@@ -200,3 +200,31 @@ type WalletBirth {
   firstSeenTimestamp: Int!
   foundActivity: Boolean!
 }
+
+
+# Who paid into a wallet. One row per (wallet, funder) pair.
+#
+# This is the edge that shows apparently separate actors sharing an
+# origin. Two agents owned by different wallets look independent until
+# both owner wallets trace back to the same payer.
+#
+# `isDust` marks native transfers below 0.01, which are gas top-ups
+# rather than real capitalisation. Carried over from telegraph-sentinel:
+# collapsing to a single earliest funder there let a trivial gas top-up
+# mask whoever actually funded the wallet, so every funder is kept and
+# marked instead of picking one winner.
+#
+# `source` is "native" or "ausd". Both are needed because an ERC-20
+# transfer's transaction `to` is the token contract, not the recipient,
+# so token funding is invisible to a native-transaction scan. That was a
+# live-caught bug in the earlier project, not a theoretical one.
+type WalletFunder {
+  id: ID! # wallet-funder
+  wallet: String!
+  funder: String!
+  firstFundedBlock: Int!
+  firstFundedTimestamp: Int!
+  valueRaw: String!
+  source: String!
+  isDust: Boolean!
+}
