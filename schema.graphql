@@ -228,3 +228,22 @@ type WalletFunder {
   source: String!
   isDust: Boolean!
 }
+
+# How many distinct wallets a funder has paid, natively.
+#
+# Needed because dust filtering is not sufficient on its own. Measured
+# against live Monad data, a single wallet had funded 1,984 reviewer
+# wallets with ordinary non-dust amounts, accounting for 99% of every
+# funding relationship in the index. It is a faucet or distributor, not
+# an operator. Grouping by shared funder without this would flag
+# essentially every agent on the chain and make the signal worthless.
+#
+# This is the native-path equivalent of what FunderFanOut does for AUSD.
+# FunderFanOut cannot cover it, because that distributor pays in native
+# MON and never appears in AUSD data at all.
+type FunderProfile {
+  id: ID! # funder address
+  funder: String!
+  distinctWalletsFunded: Int!
+  distributorShaped: Boolean!
+}

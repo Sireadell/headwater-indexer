@@ -13,6 +13,7 @@ import {
   type SharedFunder,
   type WalletBirth,
   type WalletFunder,
+  type FunderProfile,
 } from "envio";
 import {
   getWalletAusdHistory,
@@ -54,6 +55,16 @@ const MAX_STORED_RECIPIENTS = 200;
 // signals already cover the high-volume end, and the coordinated case
 // this targets is small by design -- a handful of wallets is enough to
 // swing an agent's reputation.
+// A funder paying this many distinct wallets is distributing, not
+// coordinating. Measured against live Monad data: one wallet had funded
+// 1,984 reviewer wallets with ordinary non-dust amounts, 99% of every
+// funding relationship in the index. Grouping by shared funder without
+// excluding that would flag every agent on the chain.
+//
+// Set well above any plausible coordinated ring and well below faucet
+// scale, so a real operator funding a dozen wallets still surfaces.
+const DISTRIBUTOR_WALLET_THRESHOLD = 25;
+
 const MIN_SHARED_FUNDER_REVIEWERS = 2;
 const MAX_STORED_FUNDED_REVIEWERS = 200;
 
@@ -248,6 +259,42 @@ async function processFundingTransfer(
   }
 }
 
+// Writes one wallet-funder edge, and keeps that funder's distinct-wallet
+// count current. Counting happens here rather than at read time because
+// the dashboard only ever sees one agent's handful of wallets and cannot
+// tell a coordinator from a faucet from that alone. The distinction is
+// global, so it has to be computed where the global view exists.
+async function recordFunderEdge(
+  context: any,
+  wallet: string,
+  funder: string,
+  row: {
+    firstFundedBlock: number;
+    firstFundedTimestamp: number;
+    valueRaw: string;
+    source: string;
+    isDust: boolean;
+  },
+): Promise<void> {
+  const id = `${wallet}-${funder}`;
+  const already = await context.WalletFunder.get(id);
+
+  context.WalletFunder.set({ id, wallet, funder, ...row });
+
+  // Only a newly seen pair moves the count. A funder that paid the same
+  // wallet fifty times has funded one wallet.
+  if (already !== undefined) return;
+
+  const profile = await context.FunderProfile.get(funder);
+  const distinctWalletsFunded = (profile ? profile.distinctWalletsFunded : 0) + 1;
+  context.FunderProfile.set({
+    id: funder,
+    funder,
+    distinctWalletsFunded,
+    distributorShaped: distinctWalletsFunded >= DISTRIBUTOR_WALLET_THRESHOLD,
+  });
+}
+
 // Records when a reviewer wallet first appeared on chain, and who paid
 // into it. Runs once per wallet at the moment it is first seen
 // reviewing; the underlying lookup is cached so a redeploy does not
@@ -282,10 +329,7 @@ async function recordWalletOrigin(
   // Native funders, as found above.
   if (origin) {
     for (const f of origin.funders) {
-      context.WalletFunder.set({
-        id: `${wallet}-${f.funder}`,
-        wallet,
-        funder: f.funder,
+      await recordFunderEdge(context, wallet, f.funder, {
         firstFundedBlock: f.blockNumber,
         firstFundedTimestamp: f.timestamp,
         valueRaw: f.valueWei,
@@ -313,10 +357,7 @@ async function recordWalletOrigin(
     }
   }
   for (const [funder, record] of earliestByFunder) {
-    context.WalletFunder.set({
-      id: `${wallet}-${funder}`,
-      wallet,
-      funder,
+    await recordFunderEdge(context, wallet, funder, {
       firstFundedBlock: record.blockNumber,
       firstFundedTimestamp: record.timestamp,
       valueRaw: record.value,
