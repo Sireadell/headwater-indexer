@@ -171,3 +171,27 @@ type SharedFunder {
   exchangeShaped: Boolean!
   thresholdMet: Boolean!
 }
+
+# When a reviewer wallet first appeared on chain at all.
+#
+# Wallets provisioned together by one operator tend to be born together,
+# minutes apart, then held until needed. Independent reviewers have no
+# reason to share a birthday, so a cluster of reviewers on one agent all
+# created in the same short window is hard to explain innocently.
+#
+# This entity records only the fact per wallet. Whether a given agent's
+# reviewers cluster is decided at read time against that agent's own
+# reviewer set, since the same wallet can sit in a tight cluster for one
+# agent and a loose spread for another.
+#
+# firstSeenBlock 0 with foundActivity false means the lookup genuinely
+# found nothing, kept distinct from a wallet truly born at block zero --
+# otherwise every unknown wallet would look like the oldest on the chain
+# and cluster falsely with all the others.
+type WalletBirth {
+  id: ID! # wallet address
+  wallet: String!
+  firstSeenBlock: Int!
+  firstSeenTimestamp: Int!
+  foundActivity: Boolean!
+}

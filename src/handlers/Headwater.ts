@@ -11,8 +11,13 @@ import {
   type FunderFanOut,
   type ReviewCadence,
   type SharedFunder,
+  type WalletBirth,
 } from "envio";
-import { getWalletAusdHistory, type WalletTransferRecord } from "../effects/walletHistory";
+import {
+  getWalletAusdHistory,
+  getWalletFirstActivity,
+  type WalletTransferRecord,
+} from "../effects/walletHistory";
 
 const NANSEN_API_KEY = process.env.NANSEN_API_KEY;
 const NANSEN_BASE_URL = "https://api.nansen.ai/v2";
@@ -239,6 +244,36 @@ async function processFundingTransfer(
   if (nansen && !isLegitimateActor(nansen)) {
     context.WalletLabel.set(nansen);
   }
+}
+
+// Records when a reviewer wallet first appeared on chain. Runs once per
+// wallet, at the moment it is first seen reviewing, and the underlying
+// lookup is cached so a redeploy does not re-query it.
+async function recordWalletBirth(
+  context: any,
+  reviewerAddress: string,
+): Promise<void> {
+  const wallet = norm(reviewerAddress);
+  const existing = await context.WalletBirth.get(wallet);
+  if (existing !== undefined) return;
+
+  let birth: { blockNumber: number; timestamp: number } | null;
+  try {
+    birth = await context.effect(getWalletFirstActivity, wallet);
+  } catch (err) {
+    // A failed lookup must not be written as a real birth, or the wallet
+    // would be permanently recorded as born at block zero.
+    console.log(`Wallet birth lookup skipped for ${wallet}`);
+    return;
+  }
+
+  context.WalletBirth.set({
+    id: wallet,
+    wallet,
+    firstSeenBlock: birth ? birth.blockNumber : 0,
+    firstSeenTimestamp: birth ? birth.timestamp : 0,
+    foundActivity: birth !== null,
+  });
 }
 
 // Records that `funder` paid `reviewerAddress`, a wallet known to have
@@ -475,6 +510,7 @@ indexer.onEvent(
     // wallet), instead of only relying on the live indexed window.
     if (isNewReviewer) {
       await backfillReviewerFundingHistory(context, reviewerAddress);
+      await recordWalletBirth(context, reviewerAddress);
     }
 
     const feedback: Feedback = {

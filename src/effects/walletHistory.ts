@@ -133,3 +133,84 @@ export const getWalletAusdHistory = createEffect(
     return records;
   },
 );
+
+// When a wallet first appeared on chain at all.
+//
+// Wallets that were provisioned together by one operator tend to be born
+// together: created in a batch, minutes apart, then held until needed.
+// Genuine independent reviewers have no reason to share a birthday.
+//
+// "Born" here means the earliest block in which the address appears in
+// any transaction, sending or receiving. Receiving comes first for a
+// fresh EOA, since it cannot send anything until it has been funded for
+// gas, so both directions are queried rather than just outbound.
+//
+// Like the funding backfill above, this runs once per wallet at the
+// moment it is first seen as a reviewer, and is cached forever.
+export const getWalletFirstActivity = createEffect(
+  {
+    name: "getWalletFirstActivity",
+    input: S.string,
+    output: S.nullable(
+      S.object((ctx) => ({
+        blockNumber: ctx.field("blockNumber", S.number),
+        timestamp: ctx.field("timestamp", S.number),
+      })),
+    ),
+    rateLimit: { calls: 3, per: "second" },
+    cache: true,
+  },
+  async ({ input }): Promise<{ blockNumber: number; timestamp: number } | null> => {
+    const wallet = input.toLowerCase();
+    const client = new HypersyncClient({
+      url: HYPERSYNC_URL,
+      apiToken: process.env.ENVIO_API_TOKEN!,
+    });
+
+    const query: Query = {
+      fromBlock: 0,
+      transactions: [{ from: [wallet] }, { to: [wallet] }],
+      fieldSelection: {
+        transaction: ["BlockNumber", "From", "To"],
+        block: ["Number", "Timestamp"],
+      },
+    };
+
+    // Results come back ascending from fromBlock, so the first page that
+    // contains anything holds the earliest activity. A wallet created
+    // recently means many empty pages of older history first, hence the
+    // walk forward rather than a single call -- capped so one pathological
+    // case cannot stall the indexer.
+    let fromBlock = 0;
+    const MAX_PAGES = 50;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const res = await client.get({ ...query, fromBlock });
+
+      if (res.data.transactions.length > 0) {
+        let earliest = Number.MAX_SAFE_INTEGER;
+        for (const tx of res.data.transactions) {
+          if (tx.blockNumber !== undefined && tx.blockNumber < earliest) {
+            earliest = tx.blockNumber;
+          }
+        }
+        if (earliest !== Number.MAX_SAFE_INTEGER) {
+          const block = res.data.blocks.find((b) => b.number === earliest);
+          return {
+            blockNumber: earliest,
+            timestamp: block?.timestamp ?? 0,
+          };
+        }
+      }
+
+      if (res.nextBlock >= (res.archiveHeight ?? res.nextBlock)) break;
+      fromBlock = res.nextBlock;
+    }
+
+    // Reaching here means no transaction was found for this address,
+    // which is possible for a wallet whose only on-chain presence is as a
+    // log participant. Returning null keeps that distinct from "born at
+    // block zero", which would otherwise read as the oldest wallet on the
+    // chain and cluster falsely with every other unknown.
+    return null;
+  },
+);
