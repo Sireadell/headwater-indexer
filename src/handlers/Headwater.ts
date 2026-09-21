@@ -9,6 +9,7 @@ import {
   type DirectedFundingEdge,
   type CircularFunding,
   type FunderFanOut,
+  type ReviewCadence,
 } from "envio";
 import { getWalletAusdHistory, type WalletTransferRecord } from "../effects/walletHistory";
 
@@ -28,6 +29,20 @@ const MIN_FAN_OUT_SPAN_SECONDS = 25 * 60 * 60;
 // size. recipientCount, not array length, is authoritative for the
 // threshold check.
 const MAX_STORED_RECIPIENTS = 200;
+
+// Review-timing cadence thresholds.
+//
+// A genuine reviewer's gaps between reviews are ragged: minutes, then
+// hours, then days. A script's gaps are nearly identical. The
+// coefficient of variation (stddev / mean) measures exactly that
+// raggedness, and it is scale-free -- a bot firing every 50 seconds and
+// one firing every 50 minutes both score near zero, while human
+// behaviour sits well above 1.0.
+//
+// MIN_CADENCE_INTERVALS guards against calling automation on a handful
+// of points, where a tight spread can happen by chance.
+const MIN_CADENCE_INTERVALS = 5;
+const MAX_CADENCE_CV = 0.35;
 
 interface NansenWalletData {
   wallet?: {
@@ -209,6 +224,88 @@ async function processFundingTransfer(
   }
 }
 
+// Updates a reviewer's running review-timing statistics with one new
+// feedback event. Kept as running sums (count, sum, sum of squares) so
+// the per-event cost stays O(1) and no unbounded timestamp array is
+// stored -- a single wallet in the live data already has 19 reviews on
+// one agent alone.
+async function updateReviewCadence(
+  context: any,
+  reviewerAddress: string,
+  timestamp: number,
+): Promise<void> {
+  const existing = await context.ReviewCadence.get(reviewerAddress);
+
+  if (existing === undefined) {
+    // First review seen for this wallet: no interval exists yet, so
+    // there is nothing to measure until the next one arrives.
+    context.ReviewCadence.set({
+      id: reviewerAddress,
+      reviewer_id: reviewerAddress,
+      lastReviewTimestamp: timestamp,
+      reviewCount: 1,
+      intervalCount: 0,
+      intervalSumSeconds: 0,
+      intervalSumSquares: 0,
+      meanIntervalSeconds: 0,
+      stdDevSeconds: 0,
+      coefficientOfVariation: 0,
+      minIntervalSeconds: 0,
+      maxIntervalSeconds: 0,
+      automationSuspected: false,
+    });
+    return;
+  }
+
+  const interval = timestamp - existing.lastReviewTimestamp;
+
+  // Two reviews in the same block carry the same timestamp, giving a
+  // zero interval that is an artifact of block granularity rather than
+  // real timing. Counting those would drag the mean toward zero and
+  // manufacture a low CV, so the review is counted but the interval is
+  // not measured.
+  if (interval <= 0) {
+    context.ReviewCadence.set({
+      ...existing,
+      reviewCount: existing.reviewCount + 1,
+    });
+    return;
+  }
+
+  const intervalCount = existing.intervalCount + 1;
+  const intervalSumSeconds = existing.intervalSumSeconds + interval;
+  const intervalSumSquares = existing.intervalSumSquares + interval * interval;
+
+  const mean = intervalSumSeconds / intervalCount;
+  // Clamped at zero: the sum-of-squares form of variance can land a hair
+  // below zero through floating-point rounding when every interval is
+  // near-identical, which is exactly the automated case this detects.
+  const variance = Math.max(0, intervalSumSquares / intervalCount - mean * mean);
+  const stdDev = Math.sqrt(variance);
+  const coefficientOfVariation = mean > 0 ? stdDev / mean : 0;
+
+  context.ReviewCadence.set({
+    id: reviewerAddress,
+    reviewer_id: reviewerAddress,
+    lastReviewTimestamp: timestamp,
+    reviewCount: existing.reviewCount + 1,
+    intervalCount,
+    intervalSumSeconds,
+    intervalSumSquares,
+    meanIntervalSeconds: mean,
+    stdDevSeconds: stdDev,
+    coefficientOfVariation,
+    minIntervalSeconds:
+      existing.intervalCount === 0
+        ? interval
+        : Math.min(existing.minIntervalSeconds, interval),
+    maxIntervalSeconds: Math.max(existing.maxIntervalSeconds, interval),
+    automationSuspected:
+      intervalCount >= MIN_CADENCE_INTERVALS &&
+      coefficientOfVariation <= MAX_CADENCE_CV,
+  });
+}
+
 async function ensureReviewer(context: any, address: string): Promise<Reviewer> {
   const id = norm(address);
   let reviewer = await context.Reviewer.get(id);
@@ -299,6 +396,8 @@ indexer.onEvent(
       txHash: event.transaction.hash,
     };
     context.Feedback.set(feedback);
+
+    await updateReviewCadence(context, reviewerAddress, event.block.timestamp);
 
     // Re-read: the backfill above may have created FundingTransfer rows
     // touching this reviewer, but distinctAgentIds only changes here.

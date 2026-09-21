@@ -224,3 +224,105 @@ describe("Circular funding", () => {
     );
   });
 });
+
+describe("Review-timing cadence", () => {
+  const BASE_TS = 1_771_091_270;
+
+  // Replays a wallet posting reviews at the given gaps (in seconds) and
+  // returns its resulting cadence row.
+  const runWithGaps = async (gaps: number[], reviewer: string) => {
+    const indexer = createTestIndexer();
+    let ts = BASE_TS;
+    let index = 0n;
+
+    const feedbackAt = (timestamp: number, feedbackIndex: bigint) => ({
+      contract: "ReputationRegistry" as const,
+      event: "NewFeedback" as const,
+      block: { timestamp },
+      params: {
+        agentId: 153n,
+        clientAddress: reviewer as `0x${string}`,
+        feedbackIndex,
+        value: 90n,
+        valueDecimals: 0n,
+        indexedTag1: "",
+        tag1: "",
+        tag2: "",
+        endpoint: "",
+        feedbackURI: "",
+        feedbackHash: "0x" + "00".repeat(32),
+      },
+    });
+
+    await indexer.process({
+      chains: { [CHAIN_ID]: { simulate: [feedbackAt(ts, index++)] } },
+    });
+    for (const gap of gaps) {
+      ts += gap;
+      await indexer.process({
+        chains: { [CHAIN_ID]: { simulate: [feedbackAt(ts, index++)] } },
+      });
+    }
+
+    return indexer.ReviewCadence.getOrThrow(reviewer.toLowerCase());
+  };
+
+  it("flags the machine-like cadence actually observed on-chain", async (t) => {
+    // These are the real gaps between the first ten reviews wallet
+    // 0xb08e06cf...d91a left on agent 153, read off the live indexer.
+    const realBotGaps = [56, 53, 48, 49, 49, 55, 51, 57, 49];
+    const cadence = await runWithGaps(realBotGaps, Addresses.mockAddresses[0]!);
+
+    t.expect(cadence.intervalCount).toBe(9);
+    t.expect(
+      cadence.coefficientOfVariation,
+      "near-identical gaps should score far below the 0.35 automation threshold",
+    ).toBeLessThan(0.2);
+    t.expect(
+      cadence.automationSuspected,
+      "a wallet posting reviews 48-57s apart, nine times running, should be flagged",
+    ).toBe(true);
+  });
+
+  it("does not flag ragged, human-looking review gaps", async (t) => {
+    // Minutes, then hours, then a day: what real review behaviour looks like.
+    const humanGaps = [340, 86_400, 1_200, 43_200, 900, 172_800, 7_200, 600, 259_200];
+    const cadence = await runWithGaps(humanGaps, Addresses.mockAddresses[1]!);
+
+    t.expect(cadence.intervalCount).toBe(9);
+    t.expect(
+      cadence.coefficientOfVariation,
+      "wildly varying gaps should score well above the threshold",
+    ).toBeGreaterThan(1);
+    t.expect(
+      cadence.automationSuspected,
+      "irregular human timing must never be flagged as automation",
+    ).toBe(false);
+  });
+
+  it("will not call automation on too few intervals, however uniform", async (t) => {
+    // Perfectly uniform, but only three gaps -- far too little to claim
+    // a pattern, and exactly the case a naive CV check would false-positive on.
+    const cadence = await runWithGaps([60, 60, 60], Addresses.mockAddresses[2]!);
+
+    t.expect(cadence.intervalCount).toBe(3);
+    t.expect(cadence.coefficientOfVariation).toBe(0);
+    t.expect(
+      cadence.automationSuspected,
+      "three identical gaps is not enough evidence, despite a perfect CV",
+    ).toBe(false);
+  });
+
+  it("ignores same-block reviews instead of scoring them as perfect regularity", async (t) => {
+    // Six reviews sharing one timestamp produce zero-second gaps. Counting
+    // those would drive the CV to zero and manufacture a false flag.
+    const cadence = await runWithGaps([0, 0, 0, 0, 0, 0], Addresses.mockAddresses[3]!);
+
+    t.expect(cadence.reviewCount, "every review still counts").toBe(7);
+    t.expect(
+      cadence.intervalCount,
+      "but zero-length gaps are block-granularity artifacts, not timing evidence",
+    ).toBe(0);
+    t.expect(cadence.automationSuspected).toBe(false);
+  });
+});
