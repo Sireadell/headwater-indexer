@@ -149,8 +149,18 @@ type ReviewCadence {
   coefficientOfVariation: Float!
   minIntervalSeconds: Int!
   maxIntervalSeconds: Int!
-  # True only once there are enough intervals to be meaningful AND the
-  # gaps are tight enough to be implausible for a human.
+  # The most recent intervals, bounded, so a scripted burst can be seen
+  # even when the wallet's full stream on this agent is ragged overall.
+  # Observed live: one wallet posted 10 reviews at ~60s gaps, paused 54
+  # minutes, then posted 9 more at irregular gaps. Whole-stream CV hid
+  # the burst entirely. The fraud is "a scripted run happened", not
+  # "every review was scripted".
+  recentIntervals: [Int!]!
+  # Latches true the first time any window of recent intervals is tight
+  # enough to be implausible for a human, and never unsets: later ragged
+  # reviews do not un-happen an earlier scripted run.
+  burstDetected: Boolean!
+  # Whole-stream verdict OR a detected burst.
   automationSuspected: Boolean!
 }
 

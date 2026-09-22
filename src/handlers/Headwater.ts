@@ -65,6 +65,11 @@ const MAX_STORED_FUNDED_REVIEWERS = 200;
 
 const MIN_CADENCE_INTERVALS = 5;
 const MAX_CADENCE_CV = 0.35;
+// Burst window. Ten intervals is long enough that a tight run is not a
+// coincidence and short enough to fit inside a scripted batch before the
+// operator moves on. A window is judged by the same CV threshold as the
+// whole stream, on at least MIN_CADENCE_INTERVALS points.
+const CADENCE_WINDOW = 10;
 
 interface NansenWalletData {
   wallet?: {
@@ -433,6 +438,8 @@ async function updateReviewCadence(
       coefficientOfVariation: 0,
       minIntervalSeconds: 0,
       maxIntervalSeconds: 0,
+      recentIntervals: [],
+      burstDetected: false,
       automationSuspected: false,
     });
     return;
@@ -465,6 +472,20 @@ async function updateReviewCadence(
   const stdDev = Math.sqrt(variance);
   const coefficientOfVariation = mean > 0 ? stdDev / mean : 0;
 
+  // Sliding window over the most recent intervals. Kept bounded so the
+  // row cannot grow without limit on a wallet that reviews forever.
+  const recentIntervals = [...existing.recentIntervals, interval].slice(-CADENCE_WINDOW);
+  let windowTight = false;
+  if (recentIntervals.length >= MIN_CADENCE_INTERVALS) {
+    const wMean = recentIntervals.reduce((a, b) => a + b, 0) / recentIntervals.length;
+    const wVar =
+      recentIntervals.reduce((a, b) => a + (b - wMean) * (b - wMean), 0) / recentIntervals.length;
+    const wCv = wMean > 0 ? Math.sqrt(wVar) / wMean : 0;
+    windowTight = wCv <= MAX_CADENCE_CV;
+  }
+  // Latching: an earlier scripted run is not undone by later ragged reviews.
+  const burstDetected = existing.burstDetected || windowTight;
+
   context.ReviewCadence.set({
     id: cadenceId,
     agent_id: agentId,
@@ -482,9 +503,11 @@ async function updateReviewCadence(
         ? interval
         : Math.min(existing.minIntervalSeconds, interval),
     maxIntervalSeconds: Math.max(existing.maxIntervalSeconds, interval),
+    recentIntervals,
+    burstDetected,
     automationSuspected:
-      intervalCount >= MIN_CADENCE_INTERVALS &&
-      coefficientOfVariation <= MAX_CADENCE_CV,
+      burstDetected ||
+      (intervalCount >= MIN_CADENCE_INTERVALS && coefficientOfVariation <= MAX_CADENCE_CV),
   });
 }
 
@@ -511,6 +534,16 @@ indexer.onEvent(
       registeredAtTimestamp: event.block.timestamp,
     };
     context.Agent.set(agent);
+
+    // Trace the owner's origin the same way reviewers are traced. Without
+    // this the strongest finding in the live data was invisible to the
+    // product: agent 153's owner paid 5.000 MON to each of the wallets that
+    // own agents 154-158, but none of those five ever reviewed anything,
+    // so nothing ever looked them up. Owners are the party with the motive
+    // to buy reputation, so their funding graph matters at least as much
+    // as the reviewers'. Cheap, too: a few hundred agents against several
+    // thousand reviewers.
+    await recordWalletOrigin(context, ownerAddr);
 
     // Screen the new agent's owner wallet against Nansen at registration
     // time -- a live gatekeeping check, not a side-lookup after the fact.

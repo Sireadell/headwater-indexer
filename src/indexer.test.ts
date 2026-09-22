@@ -636,3 +636,82 @@ describe("Review-timing cadence, per-agent scoping", () => {
     ).toBe(false);
   });
 });
+
+describe("Review-timing cadence, burst inside a ragged stream", () => {
+  // Regression test for the second production miss. Wallet 0xe0554... on
+  // agent 153 posted ten reviews at 51-82s gaps, paused 54 minutes, then
+  // posted nine more at irregular gaps. Per-agent whole-stream CV came out
+  // at 1.73 and it went unflagged, though the first ten reviews are
+  // unmistakably scripted. These are the real gaps from the live indexer.
+  const scriptedBurst = [79, 66, 51, 59, 76, 82, 62, 79, 58];
+  const pause = 3_231;
+  const raggedTail = [124, 132, 224, 100, 94, 955, 1_583, 1_465];
+
+  const review = (reviewer: string, timestamp: number, feedbackIndex: bigint) => ({
+    contract: "ReputationRegistry" as const,
+    event: "NewFeedback" as const,
+    block: { timestamp },
+    params: {
+      agentId: 153n,
+      clientAddress: reviewer as `0x${string}`,
+      feedbackIndex,
+      value: 90n,
+      valueDecimals: 0n,
+      indexedTag1: "",
+      tag1: "",
+      tag2: "",
+      endpoint: "",
+      feedbackURI: "",
+      feedbackHash: "0x" + "00".repeat(32),
+    },
+  });
+
+  it("flags a scripted burst even when later reviews are irregular", async (t) => {
+    const indexer = createTestIndexer();
+    const reviewer = Addresses.mockAddresses[0]!;
+    let ts = 1_771_091_270;
+    let index = 0n;
+
+    const events = [review(reviewer, ts, index++)];
+    for (const gap of [...scriptedBurst, pause, ...raggedTail]) {
+      ts += gap;
+      events.push(review(reviewer, ts, index++));
+    }
+    for (const e of events) {
+      await indexer.process({ chains: { [CHAIN_ID]: { simulate: [e] } } });
+    }
+
+    const row = await indexer.ReviewCadence.getOrThrow(`153-${reviewer.toLowerCase()}`);
+
+    t.expect(
+      Number(row.coefficientOfVariation),
+      "test setup: the whole stream must be ragged, or this proves nothing",
+    ).toBeGreaterThan(0.35);
+    t.expect(row.burstDetected, "the opening scripted run must have been caught").toBe(true);
+    t.expect(
+      row.automationSuspected,
+      "a wallet that scripted ten reviews is automated, however it behaved afterwards",
+    ).toBe(true);
+    t.expect(row.recentIntervals.length, "the window stays bounded").toBeLessThanOrEqual(10);
+  });
+
+  it("does not latch a burst from a stream that was never tight", async (t) => {
+    const indexer = createTestIndexer();
+    const reviewer = Addresses.mockAddresses[1]!;
+    let ts = 1_771_200_000;
+    let index = 0n;
+
+    const events = [review(reviewer, ts, index++)];
+    for (const gap of [340, 86_400, 1_200, 43_200, 900, 172_800, 7_200, 600, 259_200, 3_000, 50_000]) {
+      ts += gap;
+      events.push(review(reviewer, ts, index++));
+    }
+    for (const e of events) {
+      await indexer.process({ chains: { [CHAIN_ID]: { simulate: [e] } } });
+    }
+
+    const row = await indexer.ReviewCadence.getOrThrow(`153-${reviewer.toLowerCase()}`);
+    t.expect(row.burstDetected, "no window of human-paced reviews should read as a burst").toBe(false);
+    t.expect(row.automationSuspected).toBe(false);
+  });
+});
