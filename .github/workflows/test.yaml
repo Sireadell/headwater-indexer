@@ -3,10 +3,10 @@
 # This workflow runs your indexer tests on every push to main and on pull requests.
 # It ensures your indexer code compiles correctly and all tests pass before merging.
 #
-# Prerequisites:
-# - Your project uses pnpm as the package manager
-# - Vitest is installed (included by default in envio projects)
-# - You have a "test" script defined in package.json (e.g., "test": "vitest run")
+# This repository uses npm, not pnpm. The starter workflow shipped with
+# pnpm and a cache: 'pnpm' setting, and with no pnpm lockfile here the
+# Setup Node.js step failed before install, codegen or tests ever ran. Every
+# push was therefore red for a reason that had nothing to do with the code.
 #
 # Required: ENVIO_API_TOKEN
 # Envio indexers use HyperSync as the default data source, which requires an Envio API token.
@@ -33,34 +33,27 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Set up pnpm package manager
-      # Update the version below if you need a different pnpm version
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
       # Set up Node.js with caching for faster installs
-      # The cache: 'pnpm' option caches dependencies between runs
+      # The cache: 'npm' option caches dependencies between runs
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: 'pnpm'
+          cache: 'npm'
 
       # Install project dependencies
       - name: Install dependencies
-        run: pnpm install
+        run: npm ci
 
       # Generate indexer types
       # This step is required before running tests
       - name: Run codegen
-        run: pnpm codegen
+        run: npm run codegen
         env:
           ENVIO_API_TOKEN: ${{ secrets.ENVIO_API_TOKEN }}
 
       # Run your indexer tests using Vitest
       - name: Run tests
-        run: pnpm test
+        run: npm test
         env:
           ENVIO_API_TOKEN: ${{ secrets.ENVIO_API_TOKEN }}
