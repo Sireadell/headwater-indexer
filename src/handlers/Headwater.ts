@@ -580,6 +580,15 @@ indexer.onEvent(
       await recordWalletOrigin(context, reviewerAddress);
     }
 
+    // A smart wallet or a contract can have its review sent by someone else.
+    // When it is, that sender is who actually paid for the review, so its own
+    // funding history is pulled too. recordWalletOrigin is cached per wallet,
+    // so a sender behind many reviews costs one lookup.
+    const txFrom = norm(event.transaction.from ?? reviewerAddress);
+    if (txFrom !== reviewerAddress) {
+      await recordWalletOrigin(context, txFrom);
+    }
+
     const feedback: Feedback = {
       id: `${agentId}-${reviewerAddress}-${event.params.feedbackIndex.toString()}`,
       agent_id: agentId,
@@ -593,6 +602,7 @@ indexer.onEvent(
       blockNumber: event.block.number,
       timestamp: event.block.timestamp,
       txHash: event.transaction.hash,
+      txFrom,
     };
     context.Feedback.set(feedback);
 

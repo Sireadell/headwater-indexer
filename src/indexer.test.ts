@@ -715,3 +715,42 @@ describe("Review-timing cadence, burst inside a ragged stream", () => {
     t.expect(row.automationSuspected).toBe(false);
   });
 });
+
+describe("Who sent the review", () => {
+  it("records the transaction sender when someone else sends a smart wallet's review", async (t) => {
+    const indexer = createTestIndexer();
+    const smartWallet = Addresses.mockAddresses[0]!;
+    const owner = Addresses.mockAddresses[1]!;
+
+    await indexer.process({
+      chains: {
+        [CHAIN_ID]: {
+          simulate: [
+            {
+              contract: "ReputationRegistry",
+              event: "NewFeedback",
+              transaction: { from: owner },
+              params: {
+                agentId: 7n,
+                clientAddress: smartWallet,
+                feedbackIndex: 0n,
+                value: 100n,
+                valueDecimals: 0n,
+                indexedTag1: "",
+                tag1: "",
+                tag2: "",
+                endpoint: "",
+                feedbackURI: "",
+                feedbackHash: "0x" + "00".repeat(32),
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    const fb = await indexer.Feedback.getOrThrow(`7-${smartWallet.toLowerCase()}-0`);
+    t.expect(fb.reviewer_id).toBe(smartWallet.toLowerCase());
+    t.expect(fb.txFrom, "the sender, not the reviewer, paid for this review").toBe(owner.toLowerCase());
+  });
+});
