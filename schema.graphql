@@ -35,6 +35,10 @@ type Feedback {
   blockNumber: Int!
   timestamp: Int!
   txHash: String!
+  # Who sent and paid for the transaction that carried this review. For an
+  # ordinary wallet this is the reviewer itself. For a smart wallet or a
+  # contract it can be someone else, including the agent's own owner.
+  txFrom: String!
 }
 
 type FundingTransfer {

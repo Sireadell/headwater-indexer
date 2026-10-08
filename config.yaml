@@ -5,6 +5,7 @@ disable_default_cross_chain: true
 field_selection:
   transaction_fields:
     - hash
+    - from
 contracts:
   - name: IdentityRegistry
     events:
